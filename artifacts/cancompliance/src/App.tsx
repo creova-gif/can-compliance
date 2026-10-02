@@ -3,6 +3,14 @@ import { Switch, Route, Router as WouterRouter, Redirect, useLocation, Link } fr
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { ClerkProvider, HandleSSOCallback, TaskChooseOrganization, TaskResetPassword, TaskSetupMFA, useAuth, useClerk, useSession, useSignIn, useSignUp } from "@clerk/react";
 import { Eye, EyeOff, Scale, ClipboardCheck, Building2, ArrowRight } from "lucide-react";
+import {
+  homeRouteDecision,
+  protectedRouteDecision,
+  publicRouteDecision,
+  sessionTaskUrls,
+  sessionTasksDecision,
+  signInNeedsFactorChallenge,
+} from "@/lib/authFlow";
 import { getDemoRole, setDemoRole } from "@/lib/demoSession";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -187,27 +195,37 @@ const WrappedDocumentQA = withLayout(DocumentQA, "Document Library & RAG", "Uplo
 
 function ProtectedRoute({ component: Component }: { component: React.ComponentType }) {
   const { isSignedIn, isLoaded } = useAuth();
+  const { session, isLoaded: sessionLoaded } = useSession();
   // Allow demo sessions to bypass Clerk auth
-  if (getDemoRole()) {
+  const decision = protectedRouteDecision({
+    demo: Boolean(getDemoRole()),
+    loaded: isLoaded && sessionLoaded,
+    signedIn: Boolean(isSignedIn),
+    hasPendingTask: Boolean(session?.currentTask),
+  });
+  if (decision === "demo" || decision === "allow") {
     return (
       <ErrorBoundary label="Module Error">
         <Component />
       </ErrorBoundary>
     );
   }
-  if (!isLoaded) return <PageLoader />;
-  if (!isSignedIn) return <Redirect to="/sign-in" />;
-  return (
-    <ErrorBoundary label="Module Error">
-      <Component />
-    </ErrorBoundary>
-  );
+  if (decision === "loading") return <PageLoader />;
+  if (decision === "session-tasks") return <Redirect to="/session-tasks" />;
+  return <Redirect to="/sign-in" />;
 }
 
 function HomeRoute() {
   const { isSignedIn, isLoaded } = useAuth();
+  const { session, isLoaded: sessionLoaded } = useSession();
+  const decision = homeRouteDecision({
+    loaded: isLoaded && sessionLoaded,
+    signedIn: Boolean(isSignedIn),
+    hasPendingTask: Boolean(session?.currentTask),
+  });
   // Render landing immediately — redirect fires only once auth is confirmed
-  if (isLoaded && isSignedIn) return <Redirect to="/dashboard" />;
+  if (decision === "session-tasks") return <Redirect to="/session-tasks" />;
+  if (decision === "dashboard") return <Redirect to="/dashboard" />;
   return <Landing />;
 }
 
@@ -262,7 +280,14 @@ function AuthLayout({ children }: { children: React.ReactNode }) {
 // While Clerk is loading we render children immediately so there's no blank flash
 function PublicRoute({ children }: { children: React.ReactNode }) {
   const { isSignedIn, isLoaded } = useAuth();
-  if (isLoaded && isSignedIn) return <Redirect to="/dashboard" />;
+  const { session, isLoaded: sessionLoaded } = useSession();
+  const decision = publicRouteDecision({
+    loaded: isLoaded && sessionLoaded,
+    signedIn: Boolean(isSignedIn),
+    hasPendingTask: Boolean(session?.currentTask),
+  });
+  if (decision === "session-tasks") return <Redirect to="/session-tasks" />;
+  if (decision === "dashboard") return <Redirect to="/dashboard" />;
   return <>{children}</>;
 }
 
@@ -372,6 +397,109 @@ function navigateAfterAuth(
   setLocation(stripBase(destination));
 }
 
+function SecondFactorChallenge({
+  identifier,
+  autoSend,
+  onComplete,
+  onBack,
+}: {
+  identifier: string | null;
+  autoSend: boolean;
+  onComplete: () => Promise<string | null>;
+  onBack: () => void;
+}) {
+  const { isLoaded } = useAuth();
+  const { signIn, fetchStatus } = useSignIn();
+  const [code, setCode] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [prepared, setPrepared] = useState(false);
+  const [error, setError] = useState("");
+  const sentRef = useRef(false);
+  const ready = isLoaded && fetchStatus !== "fetching" && !loading;
+  const destination = identifier
+    ? <span className="text-foreground font-medium">{identifier}</span>
+    : <span className="text-foreground font-medium">your email</span>;
+
+  useEffect(() => {
+    if (!autoSend || !isLoaded || sentRef.current) return;
+    if (!signInNeedsFactorChallenge(signIn.status)) return;
+    sentRef.current = true;
+    const emailFactor = signIn.supportedSecondFactors.find((factor) => factor.strategy === "email_code");
+    if (!emailFactor) {
+      setError("This account needs another verification step that this page cannot complete.");
+      return;
+    }
+    void (async () => {
+      setLoading(true);
+      const { error: sendError } = await signIn.mfa.sendEmailCode();
+      setLoading(false);
+      if (sendError) {
+        setError(clerkErrorText(sendError, "Could not send a verification code."));
+        return;
+      }
+      setPrepared(true);
+    })();
+  }, [autoSend, isLoaded, signIn, signIn.status]);
+
+  const handleVerify = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!ready) return;
+    setLoading(true); setError("");
+    try {
+      const { error: verifyError } = await signIn.mfa.verifyEmailCode({ code });
+      if (verifyError) {
+        setError(clerkErrorText(verifyError, "Invalid code. Please check your email and try again."));
+        return;
+      }
+      if (signIn.status === "complete") {
+        const message = await onComplete();
+        if (message) setError(message);
+        return;
+      }
+      setError("Verification did not finish sign-in. Try again.");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "";
+      setError(message || "Invalid code. Please check your email and try again.");
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="w-full max-w-sm">
+      <div className="mb-7">
+        <h1 className="font-serif italic text-2xl text-foreground mb-1">Verify it's you</h1>
+        <p className="text-[13px] text-muted-foreground">
+          {error && !prepared
+            ? <>This verification step could not be started.</>
+            : prepared
+              ? <>We sent a 6-digit code to {destination}. Enter it to finish signing in.</>
+              : <>Sending a verification code to {destination}.</>}
+        </p>
+      </div>
+      <form onSubmit={handleVerify} className="space-y-4">
+        <div>
+          <label className="block text-[13px] font-medium text-foreground mb-1.5">Verification code</label>
+          <input type="text" inputMode="numeric" maxLength={6}
+            value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ""))}
+            placeholder="123456" required autoFocus
+            className={inputCls + " text-center text-lg tracking-[0.3em] font-mono"}
+            data-testid="sign-in-verify-code"
+          />
+        </div>
+        <AuthError msg={error} />
+        <button type="submit" disabled={!ready || code.length < 6}
+          className="w-full py-2.5 rounded-xl text-[13px] font-semibold transition-opacity disabled:opacity-60"
+          style={btnPrimary} data-testid="sign-in-verify-submit">
+          {loading ? (prepared ? "Verifying…" : "Sending…") : "Verify"}
+        </button>
+      </form>
+      <button type="button" onClick={onBack}
+        className="w-full text-center text-[12px] text-muted-foreground hover:text-foreground mt-4 transition-colors">
+        ← Back to sign in
+      </button>
+    </div>
+  );
+}
+
 function SignInPage() {
   const { isLoaded } = useAuth();
   const { signIn, fetchStatus } = useSignIn();
@@ -379,18 +507,29 @@ function SignInPage() {
   const [step, setStep] = useState<"form" | "verify">("form");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [code, setCode] = useState("");
+  const [dismissedChallenge, setDismissedChallenge] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const ready = isLoaded && fetchStatus !== "fetching" && !loading;
+
+  useEffect(() => {
+    if (!isLoaded || dismissedChallenge) return;
+    if (signInNeedsFactorChallenge(signIn.status)) setStep("verify");
+    if (signIn.status === "needs_new_password") {
+      setError("Your password must be reset before you can sign in.");
+    }
+  }, [dismissedChallenge, isLoaded, signIn.status]);
 
   const finishSignIn = async () => {
     const { error: finalizeError } = await signIn.finalize({
       navigate: (params) => navigateAfterAuth(setLocation, params),
     });
     if (finalizeError) {
-      setError(clerkErrorText(finalizeError, "Sign in could not be completed."));
+      const message = clerkErrorText(finalizeError, "Sign in could not be completed.");
+      setError(message);
+      return message;
     }
+    return null;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -409,17 +548,8 @@ function SignInPage() {
         return;
       }
 
-      if (signIn.status === "needs_client_trust" || signIn.status === "needs_second_factor") {
-        const emailFactor = signIn.supportedSecondFactors.find((factor) => factor.strategy === "email_code");
-        if (!emailFactor) {
-          setError("This account needs another verification step that this page cannot complete. Try Google sign-in.");
-          return;
-        }
-        const { error: sendError } = await signIn.mfa.sendEmailCode();
-        if (sendError) {
-          setError(clerkErrorText(sendError, "Could not send a verification code."));
-          return;
-        }
+      if (signInNeedsFactorChallenge(signIn.status)) {
+        setDismissedChallenge(false);
         setStep("verify");
         return;
       }
@@ -433,27 +563,6 @@ function SignInPage() {
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "";
       setError(message || "Sign in failed. Check your credentials.");
-    } finally { setLoading(false); }
-  };
-
-  const handleVerify = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!ready) return;
-    setLoading(true); setError("");
-    try {
-      const { error: verifyError } = await signIn.mfa.verifyEmailCode({ code });
-      if (verifyError) {
-        setError(clerkErrorText(verifyError, "Invalid code. Please check your email and try again."));
-        return;
-      }
-      if (signIn.status === "complete") {
-        await finishSignIn();
-        return;
-      }
-      setError("Verification did not finish sign-in. Try again.");
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "";
-      setError(message || "Invalid code. Please check your email and try again.");
     } finally { setLoading(false); }
   };
 
@@ -476,35 +585,12 @@ function SignInPage() {
     return (
       <PublicRoute>
         <AuthLayout>
-          <div className="w-full max-w-sm">
-            <div className="mb-7">
-              <h1 className="font-serif italic text-2xl text-foreground mb-1">Verify it's you</h1>
-              <p className="text-[13px] text-muted-foreground">
-                We sent a 6-digit code to <span className="text-foreground font-medium">{email}</span>. Enter it to finish signing in.
-              </p>
-            </div>
-            <form onSubmit={handleVerify} className="space-y-4">
-              <div>
-                <label className="block text-[13px] font-medium text-foreground mb-1.5">Verification code</label>
-                <input type="text" inputMode="numeric" maxLength={6}
-                  value={code} onChange={e => setCode(e.target.value.replace(/\D/g, ""))}
-                  placeholder="123456" required autoFocus
-                  className={inputCls + " text-center text-lg tracking-[0.3em] font-mono"}
-                  data-testid="sign-in-verify-code"
-                />
-              </div>
-              <AuthError msg={error} />
-              <button type="submit" disabled={!ready || code.length < 6}
-                className="w-full py-2.5 rounded-xl text-[13px] font-semibold transition-opacity disabled:opacity-60"
-                style={btnPrimary} data-testid="sign-in-verify-submit">
-                {loading ? "Verifying…" : "Verify"}
-              </button>
-            </form>
-            <button onClick={() => { setStep("form"); setError(""); setCode(""); }}
-              className="w-full text-center text-[12px] text-muted-foreground hover:text-foreground mt-4 transition-colors">
-              ← Back to sign in
-            </button>
-          </div>
+          <SecondFactorChallenge
+            identifier={email || signIn.identifier}
+            autoSend
+            onComplete={finishSignIn}
+            onBack={() => { setDismissedChallenge(true); setStep("form"); setError(""); }}
+          />
         </AuthLayout>
       </PublicRoute>
     );
@@ -832,6 +918,7 @@ function AppBody() {
   return (
     <Switch>
       <Route path="/" component={HomeRoute} />
+      <Route path="/sign-in/tasks/*?" component={() => <Redirect to="/session-tasks" />} />
       <Route path="/sign-in/*?" component={SignInPage} />
       <Route path="/sign-up/*?" component={SignUpPage} />
       <Route path="/sso-callback" component={SsoCallbackPage} />
@@ -908,7 +995,44 @@ function AppBody() {
 }
 
 function SsoCallbackPage() {
+  const { isLoaded } = useAuth();
+  const { signIn } = useSignIn();
   const [, setLocation] = useLocation();
+  const [challenge, setChallenge] = useState(false);
+
+  const finishSignIn = async () => {
+    const { error: finalizeError } = await signIn.finalize({
+      navigate: (params) => navigateAfterAuth(setLocation, params),
+    });
+    if (finalizeError) return clerkErrorText(finalizeError, "Sign in could not be completed.");
+    return null;
+  };
+
+  // HandleSSOCallback redirects needs_second_factor to sign-in and does not
+  // handle needs_client_trust at all. Keep both on this page so the email-code
+  // step can finish the attempt.
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (signInNeedsFactorChallenge(signIn.status)) setChallenge(true);
+  }, [isLoaded, signIn.status]);
+
+  if (challenge) {
+    return (
+      <PublicRoute>
+        <AuthLayout>
+          <SecondFactorChallenge
+            identifier={signIn.identifier}
+            autoSend
+            onComplete={finishSignIn}
+            onBack={() => {
+              void signIn.reset();
+              setLocation("/sign-in");
+            }}
+          />
+        </AuthLayout>
+      </PublicRoute>
+    );
+  }
 
   return (
     <AuthLayout>
@@ -918,7 +1042,13 @@ function SsoCallbackPage() {
         <p className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Completing sign-in…</p>
         <HandleSSOCallback
           navigateToApp={(params) => navigateAfterAuth(setLocation, params)}
-          navigateToSignIn={() => setLocation("/sign-in")}
+          navigateToSignIn={() => {
+            if (signInNeedsFactorChallenge(signIn.status)) {
+              setChallenge(true);
+              return;
+            }
+            setLocation("/sign-in");
+          }}
           navigateToSignUp={() => setLocation("/sign-up")}
         />
       </div>
@@ -928,17 +1058,26 @@ function SsoCallbackPage() {
 
 function SessionTasksPage() {
   const { isLoaded, session } = useSession();
-  if (!isLoaded) return <PageLoader />;
+  const decision = sessionTasksDecision({
+    loaded: isLoaded,
+    hasSession: Boolean(session),
+    hasTask: Boolean(session?.currentTask),
+  });
+  if (decision === "loading") return <PageLoader />;
+  if (decision === "dashboard") return <Redirect to="/dashboard" />;
+  if (decision === "sign-in") return <Redirect to="/sign-in" />;
+
   const task = session?.currentTask;
   const redirectUrlComplete = `${basePath}/dashboard`;
-  if (!session || !task) return <Redirect to="/dashboard" />;
-
   return (
     <AuthLayout>
       <div className="w-full max-w-md">
-        {task.key === "choose-organization" && <TaskChooseOrganization redirectUrlComplete={redirectUrlComplete} />}
-        {task.key === "reset-password" && <TaskResetPassword redirectUrlComplete={redirectUrlComplete} />}
-        {task.key === "setup-mfa" && <TaskSetupMFA redirectUrlComplete={redirectUrlComplete} />}
+        {task?.key === "choose-organization" && <TaskChooseOrganization redirectUrlComplete={redirectUrlComplete} />}
+        {task?.key === "reset-password" && <TaskResetPassword redirectUrlComplete={redirectUrlComplete} />}
+        {task?.key === "setup-mfa" && <TaskSetupMFA redirectUrlComplete={redirectUrlComplete} />}
+        {task && task.key !== "choose-organization" && task.key !== "reset-password" && task.key !== "setup-mfa" && (
+          <p className="text-[13px] text-muted-foreground">This sign-in step cannot be completed here.</p>
+        )}
       </div>
     </AuthLayout>
   );
@@ -953,6 +1092,7 @@ function ClerkProviderWithRoutes() {
       proxyUrl={clerkProxyUrl}
       signInUrl={`${basePath}/sign-in`}
       signUpUrl={`${basePath}/sign-up`}
+      taskUrls={sessionTaskUrls(basePath)}
       routerPush={(to) => setLocation(stripBase(to))}
       routerReplace={(to) => setLocation(stripBase(to), { replace: true })}
     >
